@@ -18,8 +18,27 @@ AMVERA_MODEL = os.getenv("AMVERA_MODEL", "deepseek-v3")
 LLM_TIMEOUT = 15
 MAX_SENTENCES = 7
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
-LOG_CSV_PATH = LOG_DIR / os.getenv("LOG_CSV_FILE", "bot.csv")
+LOG_CSV_FILE = os.getenv("LOG_CSV_FILE", "bot.csv")
+
+
+def resolve_log_dir() -> Path:
+    """
+    Amvera: постоянный диск обычно смонтирован в /data → logs/bot.csv виден в Data.
+    Локально: папка logs/ в каталоге проекта.
+    """
+    explicit = os.getenv("LOG_DIR")
+    if explicit:
+        path = Path(explicit)
+        if path == Path("logs") and Path("/data").is_dir():
+            return Path("/data/logs")
+        return path
+    if Path("/data").is_dir():
+        return Path("/data/logs")
+    return Path("logs")
+
+
+LOG_DIR = resolve_log_dir()
+LOG_CSV_PATH = LOG_DIR / LOG_CSV_FILE
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("Задайте TELEGRAM_BOT_TOKEN в .env")
@@ -71,10 +90,13 @@ logger = logging.getLogger("tarot_bot")
 
 def setup_logging():
     """Консоль (текст) + CSV-файл без ротации."""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    if not LOG_CSV_PATH.exists():
-        with open(LOG_CSV_PATH, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(CSV_HEADERS)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        if not LOG_CSV_PATH.exists():
+            with open(LOG_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(CSV_HEADERS)
+    except OSError as e:
+        raise RuntimeError(f"Не удалось создать каталог логов {LOG_DIR}: {e}") from e
 
     level = getattr(logging, LOG_LEVEL, logging.INFO)
     logger.setLevel(level)
@@ -87,6 +109,7 @@ def setup_logging():
         logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     )
     logger.addHandler(console)
+    logger.info("CSV-логи: %s", LOG_CSV_PATH)
 
 
 def log_event(
