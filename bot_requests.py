@@ -9,6 +9,8 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from history_db import DB_PATH, add_message, clear_history, expire_if_inactive, get_history, init_db
+
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -48,17 +50,22 @@ if not AMVERA_API_TOKEN:
 TG_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
 LLM_URL = f"{AMVERA_API_BASE}/v1/chat/completions"
 
-PROMPT_TEMPLATE = (
-    "Ты оракул. Ответь на вопрос пользователя как таролог или психолог. "
-    "Будь немного загадочным, но полезным. Ответь с эмодзи и кратким раскладом. "
-    "И добавь долю доброй шутки. Каждая карта расклада с новой строки. "
-    f"Ответь не более чем {MAX_SENTENCES} предложениями.\n\n"
-    "Вопрос: {user_text}"
+SYSTEM_PROMPT = (
+    "Ты оракул. Отвечай на вопросы пользователя как таролог или психолог. "
+    "Будь немного загадочным, но полезным. Отвечай с эмодзи и кратким раскладом. "
+    "Добавляй долю доброй шутки. Каждая карта расклада с новой строки. "
+    f"Отвечай не более чем {MAX_SENTENCES} предложениями. "
+    "Учитывай предыдущий диалог, если он есть."
 )
 
 SHUFFLING_TEXT = "🃏 Карты тасуются…"
 ERROR_TAROT = "🔮 Сейчас тарологу плохо — карты молчат. Попробуйте чуть позже."
 NO_TEXT_HINT = "✨ Напишите вопрос обычным текстом — и я сделаю расклад."
+EXPIRY_NOTICE = (
+    "🌙 Прошло 10 дней тишины — оракул забыл прежний контекст. "
+    "Начнём с чистого расклада."
+)
+CLEAR_TEXT = "🕯️ Контекст очищен. Оракул не помнит прошлых вопросов — спрашивайте заново."
 
 START_TEXT = (
     "🔮 Добро пожаловать!\n\n"
@@ -69,7 +76,8 @@ HELP_TEXT = (
     "📖 Как пользоваться ботом:\n\n"
     "• Напишите вопрос обычным текстом — я отвечу раскладом.\n"
     "• Можно спрашивать о делах, отношениях, планах и выборе.\n"
-    "• Команды: /start — приветствие, /help — эта справка.\n\n"
+    "• Я помню до 10 последних вопросов в этом чате.\n"
+    "• Команды: /start — приветствие, /help — справка, /clear — забыть контекст.\n\n"
     "Ответы носят развлекательный характер и не заменяют совет специалиста."
 )
 
@@ -215,12 +223,18 @@ def limit_sentences(text: str, max_sentences: int = MAX_SENTENCES) -> str:
     return " ".join(parts[:max_sentences]).strip()
 
 
-def ask_deepseek(user_text: str) -> tuple[str | None, float, str, str]:
+def ask_deepseek(
+    user_text: str,
+    history: list[dict[str, str]],
+) -> tuple[str | None, float, str, str]:
     """
-    Запрос к DeepSeek v3 через Amvera.
+    Запрос к DeepSeek v3 через Amvera с учётом истории диалога.
     Возвращает: (ответ, длительность_сек, http_status, текст_ошибки).
     """
-    prompt = PROMPT_TEMPLATE.format(user_text=user_text)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
+
     headers = {
         "Content-Type": "application/json",
         "X-Auth-Token": f"Bearer {AMVERA_API_TOKEN}",
@@ -228,7 +242,7 @@ def ask_deepseek(user_text: str) -> tuple[str | None, float, str, str]:
     }
     payload = {
         "model": AMVERA_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": False,
     }
     started = time.perf_counter()
@@ -284,10 +298,28 @@ def handle_message(message):
         )
         return
 
-    send_message(chat_id, SHUFFLING_TEXT)
-    answer, llm_sec, http_status, error_text = ask_deepseek(text)
+    if text == "/clear":
+        clear_history(chat_id)
+        send_message(chat_id, CLEAR_TEXT)
+        log_event(
+            "INFO",
+            username,
+            chat_id,
+            text,
+            event="history_clear",
+        )
+        return
 
+    if expire_if_inactive(chat_id):
+        send_message(chat_id, EXPIRY_NOTICE)
+
+    history = get_history(chat_id)
+    send_message(chat_id, SHUFFLING_TEXT)
+    answer, llm_sec, http_status, error_text = ask_deepseek(text, history)
+
+    add_message(chat_id, "user", text)
     if answer:
+        add_message(chat_id, "assistant", answer)
         send_message(chat_id, answer)
         log_event(
             "INFO",
@@ -314,7 +346,9 @@ def handle_message(message):
 
 def main():
     setup_logging()
+    init_db()
     logger.info("Бот запущен")
+    logger.info("История диалогов: %s", DB_PATH)
     log_event("INFO", "", "", "", event="bot_start")
     last_update_id = 0
     while True:
