@@ -95,6 +95,8 @@ CSV_HEADERS = [
 
 logger = logging.getLogger("tarot_bot")
 
+TELEGRAM_MAX_LENGTH = 4096
+
 
 def setup_logging():
     """Консоль (текст) + CSV-файл без ротации."""
@@ -188,15 +190,30 @@ def get_updates(offset=None):
         return []
 
 
-def send_message(chat_id, text):
-    """Отправляет сообщение пользователю."""
+def send_message(chat_id, text) -> bool:
+    """Отправляет сообщение пользователю. Возвращает True при успехе."""
+    if len(text) > TELEGRAM_MAX_LENGTH:
+        text = text[: TELEGRAM_MAX_LENGTH - 3] + "..."
     try:
         response = requests.post(
             TG_URL + "sendMessage",
             json={"chat_id": chat_id, "text": text},
             timeout=10,
         )
+        data = response.json()
+        if not data.get("ok"):
+            log_event(
+                "ERROR",
+                "",
+                chat_id,
+                "",
+                http_status=str(response.status_code),
+                event="telegram_send_message",
+                error=data.get("description", "Telegram API error"),
+            )
+            return False
         response.raise_for_status()
+        return True
     except Exception as e:
         http_status = ""
         if isinstance(e, requests.HTTPError) and e.response is not None:
@@ -205,9 +222,28 @@ def send_message(chat_id, text):
             "ERROR",
             "",
             chat_id,
-            text[:200],
+            "",
             http_status=http_status,
             event="telegram_send_message",
+            error=str(e),
+        )
+        return False
+
+
+def save_history(chat_id: int, user_text: str, answer: str | None = None) -> None:
+    """Сохраняет историю; ошибки БД не блокируют ответ в Telegram."""
+    try:
+        add_message(chat_id, "user", user_text)
+        if answer:
+            add_message(chat_id, "assistant", answer)
+    except Exception as e:
+        logger.error("Не удалось сохранить историю chat=%s: %s", chat_id, e)
+        log_event(
+            "ERROR",
+            "",
+            chat_id,
+            user_text,
+            event="history_save_fail",
             error=str(e),
         )
 
@@ -317,20 +353,34 @@ def handle_message(message):
     send_message(chat_id, SHUFFLING_TEXT)
     answer, llm_sec, http_status, error_text = ask_deepseek(text, history)
 
-    add_message(chat_id, "user", text)
     if answer:
-        add_message(chat_id, "assistant", answer)
-        send_message(chat_id, answer)
-        log_event(
-            "INFO",
-            username,
-            chat_id,
-            text,
-            llm_duration_sec=str(llm_sec),
-            http_status=http_status,
-            event="llm_ok",
-        )
+        sent = send_message(chat_id, answer)
+        if sent:
+            save_history(chat_id, text, answer)
+            log_event(
+                "INFO",
+                username,
+                chat_id,
+                text,
+                llm_duration_sec=str(llm_sec),
+                http_status=http_status,
+                event="llm_ok",
+            )
+        else:
+            save_history(chat_id, text)
+            send_message(chat_id, ERROR_TAROT)
+            log_event(
+                "ERROR",
+                username,
+                chat_id,
+                text,
+                llm_duration_sec=str(llm_sec),
+                http_status=http_status,
+                event="telegram_answer_fail",
+                error="Не удалось отправить ответ в Telegram",
+            )
     else:
+        save_history(chat_id, text)
         send_message(chat_id, ERROR_TAROT)
         log_event(
             "ERROR",
