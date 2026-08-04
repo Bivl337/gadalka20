@@ -96,6 +96,8 @@ CSV_HEADERS = [
 logger = logging.getLogger("tarot_bot")
 
 TELEGRAM_MAX_LENGTH = 4096
+SEND_MESSAGE_RETRIES = 5
+SEND_MESSAGE_RETRY_DELAY = 5  # секунды между попытками
 
 
 def setup_logging():
@@ -191,43 +193,59 @@ def get_updates(offset=None):
 
 
 def send_message(chat_id, text) -> bool:
-    """Отправляет сообщение пользователю. Возвращает True при успехе."""
+    """Отправляет сообщение пользователю. До 5 попыток с паузой 5 сек. Возвращает True при успехе."""
     if len(text) > TELEGRAM_MAX_LENGTH:
         text = text[: TELEGRAM_MAX_LENGTH - 3] + "..."
-    try:
-        response = requests.post(
-            TG_URL + "sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=10,
-        )
-        data = response.json()
-        if not data.get("ok"):
-            log_event(
-                "ERROR",
-                "",
-                chat_id,
-                "",
-                http_status=str(response.status_code),
-                event="telegram_send_message",
-                error=data.get("description", "Telegram API error"),
+
+    last_error = ""
+    last_http_status = ""
+
+    for attempt in range(1, SEND_MESSAGE_RETRIES + 1):
+        try:
+            response = requests.post(
+                TG_URL + "sendMessage",
+                json={"chat_id": chat_id, "text": text},
+                timeout=10,
             )
-            return False
-        response.raise_for_status()
-        return True
-    except Exception as e:
-        http_status = ""
-        if isinstance(e, requests.HTTPError) and e.response is not None:
-            http_status = str(e.response.status_code)
-        log_event(
-            "ERROR",
-            "",
+            data = response.json()
+            if data.get("ok"):
+                if attempt > 1:
+                    logger.info(
+                        "sendMessage успех с попытки %s/%s chat=%s",
+                        attempt,
+                        SEND_MESSAGE_RETRIES,
+                        chat_id,
+                    )
+                return True
+
+            last_http_status = str(response.status_code)
+            last_error = data.get("description", "Telegram API error")
+        except Exception as e:
+            last_http_status = ""
+            if isinstance(e, requests.HTTPError) and e.response is not None:
+                last_http_status = str(e.response.status_code)
+            last_error = str(e)
+
+        logger.warning(
+            "sendMessage попытка %s/%s не удалась chat=%s: %s",
+            attempt,
+            SEND_MESSAGE_RETRIES,
             chat_id,
-            "",
-            http_status=http_status,
-            event="telegram_send_message",
-            error=str(e),
+            last_error,
         )
-        return False
+        if attempt < SEND_MESSAGE_RETRIES:
+            time.sleep(SEND_MESSAGE_RETRY_DELAY)
+
+    log_event(
+        "ERROR",
+        "",
+        chat_id,
+        "",
+        http_status=last_http_status,
+        event="telegram_send_message",
+        error=f"после {SEND_MESSAGE_RETRIES} попыток: {last_error}",
+    )
+    return False
 
 
 def save_history(chat_id: int, user_text: str, answer: str | None = None) -> None:
