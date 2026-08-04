@@ -99,6 +99,36 @@ TELEGRAM_MAX_LENGTH = 4096
 SEND_MESSAGE_RETRIES = 5
 SEND_MESSAGE_RETRY_DELAY = 5  # секунды между попытками
 
+# #region agent log
+DEBUG_LOG_PATH = Path(__file__).resolve().parent / "debug-843ab9.log"
+
+
+def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
+    import json
+
+    payload = {
+        "sessionId": "843ab9",
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data or {},
+        "timestamp": int(time.time() * 1000),
+    }
+    line = json.dumps(payload, ensure_ascii=False)
+    for path in {DEBUG_LOG_PATH, LOG_DIR / "debug-843ab9.log"}:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+    try:
+        logger.info("DBG [%s] %s %s", hypothesis_id, message, data or {})
+    except Exception:
+        pass
+# #endregion
+
 
 def setup_logging():
     """Консоль (текст) + CSV-файл без ротации."""
@@ -136,6 +166,14 @@ def log_event(
     error: str = "",
 ):
     """Пишет строку в CSV и дублирует кратко в консоль."""
+    # #region agent log
+    _agent_dbg(
+        "A",
+        "bot_requests.py:log_event:entry",
+        "log_event called",
+        {"event": event, "level": level, "chat_id": str(chat_id), "csv_path": str(LOG_CSV_PATH)},
+    )
+    # #endregion
     row = [
         datetime.now(timezone.utc).isoformat(),
         level,
@@ -147,8 +185,22 @@ def log_event(
         event,
         error,
     ]
-    with open(LOG_CSV_PATH, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(row)
+    try:
+        with open(LOG_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
+        # #region agent log
+        _agent_dbg("A", "bot_requests.py:log_event:csv_ok", "csv write ok", {"event": event})
+        # #endregion
+    except Exception as e:
+        # #region agent log
+        _agent_dbg(
+            "A",
+            "bot_requests.py:log_event:csv_fail",
+            "csv write failed",
+            {"event": event, "error": str(e)},
+        )
+        # #endregion
+        raise
 
     console_msg = (
         f"event={event} user={username} chat={chat_id} "
@@ -368,11 +420,41 @@ def handle_message(message):
         send_message(chat_id, EXPIRY_NOTICE)
 
     history = get_history(chat_id)
+    # #region agent log
+    _agent_dbg(
+        "B",
+        "bot_requests.py:handle_message:before_llm",
+        "about to call llm",
+        {"chat_id": chat_id, "history_len": len(history), "text_len": len(text)},
+    )
+    # #endregion
     send_message(chat_id, SHUFFLING_TEXT)
     answer, llm_sec, http_status, error_text = ask_deepseek(text, history)
+    # #region agent log
+    _agent_dbg(
+        "B",
+        "bot_requests.py:handle_message:after_llm",
+        "llm finished",
+        {
+            "chat_id": chat_id,
+            "has_answer": bool(answer),
+            "llm_sec": llm_sec,
+            "http_status": http_status,
+            "error_preview": (error_text or "")[:200],
+        },
+    )
+    # #endregion
 
     if answer:
         sent = send_message(chat_id, answer)
+        # #region agent log
+        _agent_dbg(
+            "C",
+            "bot_requests.py:handle_message:answer_send",
+            "oracle answer send result",
+            {"chat_id": chat_id, "sent": sent, "answer_len": len(answer)},
+        )
+        # #endregion
         if sent:
             save_history(chat_id, text, answer)
             log_event(
@@ -398,6 +480,14 @@ def handle_message(message):
                 error="Не удалось отправить ответ в Telegram",
             )
     else:
+        # #region agent log
+        _agent_dbg(
+            "B",
+            "bot_requests.py:handle_message:llm_fail_branch",
+            "entering llm_fail branch",
+            {"chat_id": chat_id, "http_status": http_status},
+        )
+        # #endregion
         save_history(chat_id, text)
         send_message(chat_id, ERROR_TAROT)
         log_event(
@@ -424,7 +514,18 @@ def main():
         for update in updates:
             last_update_id = update["update_id"]
             if "message" in update:
-                handle_message(update["message"])
+                try:
+                    handle_message(update["message"])
+                except Exception as e:
+                    # #region agent log
+                    _agent_dbg(
+                        "D",
+                        "bot_requests.py:main:handle_exception",
+                        "unhandled exception in handle_message",
+                        {"error": str(e)},
+                    )
+                    # #endregion
+                    logger.exception("Ошибка обработки сообщения: %s", e)
         time.sleep(1)
 
 
