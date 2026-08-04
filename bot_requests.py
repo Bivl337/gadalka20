@@ -17,7 +17,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AMVERA_API_TOKEN = os.getenv("AMVERA_API_TOKEN")
 AMVERA_API_BASE = os.getenv("AMVERA_API_BASE", "https://inference.waw0.amvera.ru").rstrip("/")
 AMVERA_MODEL = os.getenv("AMVERA_MODEL", "deepseek-v3")
-LLM_TIMEOUT = 15
+LLM_TIMEOUT = 45
+LLM_RETRIES = 3
+LLM_RETRY_DELAY = 3  # секунды между попытками к Amvera
 MAX_SENTENCES = 7
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_CSV_FILE = os.getenv("LOG_CSV_FILE", "bot.csv")
@@ -353,6 +355,7 @@ def ask_deepseek(
 ) -> tuple[str | None, float, str, str]:
     """
     Запрос к DeepSeek v3 через Amvera с учётом истории диалога.
+    До LLM_RETRIES попыток при таймауте/сетевой ошибке.
     Возвращает: (ответ, длительность_сек, http_status, текст_ошибки).
     """
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -372,26 +375,55 @@ def ask_deepseek(
     started = time.perf_counter()
     http_status = ""
     error_text = ""
-    try:
-        response = requests.post(
-            LLM_URL,
-            headers=headers,
-            json=payload,
-            timeout=LLM_TIMEOUT,
-        )
-        http_status = str(response.status_code)
-        response.raise_for_status()
-        data = response.json()
-        content = limit_sentences(data["choices"][0]["message"]["content"].strip())
-        duration = round(time.perf_counter() - started, 3)
-        return content, duration, http_status, ""
-    except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as e:
-        duration = round(time.perf_counter() - started, 3)
-        error_text = _redact_secrets(str(e))
-        if getattr(e, "response", None) is not None:
-            http_status = str(e.response.status_code)
-            error_text = _redact_secrets(f"{e} | body={e.response.text[:500]}")
-        return None, duration, http_status, error_text
+
+    for attempt in range(1, LLM_RETRIES + 1):
+        try:
+            response = requests.post(
+                LLM_URL,
+                headers=headers,
+                json=payload,
+                timeout=LLM_TIMEOUT,
+            )
+            http_status = str(response.status_code)
+            response.raise_for_status()
+            data = response.json()
+            content = limit_sentences(data["choices"][0]["message"]["content"].strip())
+            duration = round(time.perf_counter() - started, 3)
+            # #region agent log
+            _agent_dbg(
+                "B",
+                "bot_requests.py:ask_deepseek:ok",
+                "llm ok",
+                {"attempt": attempt, "duration": duration, "http_status": http_status},
+            )
+            # #endregion
+            return content, duration, http_status, ""
+        except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as e:
+            duration = round(time.perf_counter() - started, 3)
+            error_text = _redact_secrets(str(e))
+            if getattr(e, "response", None) is not None:
+                http_status = str(e.response.status_code)
+                error_text = _redact_secrets(f"{e} | body={e.response.text[:500]}")
+            # #region agent log
+            _agent_dbg(
+                "B",
+                "bot_requests.py:ask_deepseek:fail",
+                "llm attempt failed",
+                {
+                    "attempt": attempt,
+                    "duration": duration,
+                    "http_status": http_status,
+                    "error_preview": error_text[:200],
+                },
+            )
+            # #endregion
+            # 4xx (кроме 408/429) обычно не лечатся ретраем
+            if http_status and http_status.startswith("4") and http_status not in ("408", "429"):
+                break
+            if attempt < LLM_RETRIES:
+                time.sleep(LLM_RETRY_DELAY)
+
+    return None, round(time.perf_counter() - started, 3), http_status, error_text
 
 
 def handle_message(message):
