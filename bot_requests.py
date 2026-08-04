@@ -105,10 +105,11 @@ DEBUG_LOG_PATH = Path(__file__).resolve().parent / "debug-843ab9.log"
 
 def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
     import json
+    import sys
 
     payload = {
         "sessionId": "843ab9",
-        "runId": "pre-fix",
+        "runId": "post-fix",
         "hypothesisId": hypothesis_id,
         "location": location,
         "message": message,
@@ -123,8 +124,10 @@ def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict | Non
                 f.write(line + "\n")
         except OSError:
             pass
+    # print+flush: Amvera иногда не показывает INFO из logging
+    print(f"DBG [{hypothesis_id}] {message} {data or {}}", flush=True, file=sys.stderr)
     try:
-        logger.info("DBG [%s] %s %s", hypothesis_id, message, data or {})
+        logger.error("DBG [%s] %s %s", hypothesis_id, message, data or {})
     except Exception:
         pass
 # #endregion
@@ -138,20 +141,30 @@ def setup_logging():
             with open(LOG_CSV_PATH, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(CSV_HEADERS)
     except OSError as e:
-        raise RuntimeError(f"Не удалось создать каталог логов {LOG_DIR}: {e}") from e
+        # Не роняем бота из‑за CSV: консольные логи важнее
+        print(f"Не удалось подготовить CSV-логи {LOG_CSV_PATH}: {e}", flush=True)
 
     level = getattr(logging, LOG_LEVEL, logging.INFO)
     logger.setLevel(level)
-    if logger.handlers:
-        return
-
-    console = logging.StreamHandler()
-    console.setLevel(level)
-    console.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    )
-    logger.addHandler(console)
+    if not logger.handlers:
+        console = logging.StreamHandler()
+        console.setLevel(level)
+        console.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        )
+        logger.addHandler(console)
     logger.info("CSV-логи: %s", LOG_CSV_PATH)
+
+
+def _redact_secrets(text: str) -> str:
+    if not text:
+        return text
+    out = text
+    if TELEGRAM_BOT_TOKEN:
+        out = out.replace(TELEGRAM_BOT_TOKEN, "<TELEGRAM_TOKEN>")
+    if AMVERA_API_TOKEN:
+        out = out.replace(AMVERA_API_TOKEN, "<AMVERA_TOKEN>")
+    return out
 
 
 def log_event(
@@ -165,7 +178,8 @@ def log_event(
     event: str = "",
     error: str = "",
 ):
-    """Пишет строку в CSV и дублирует кратко в консоль."""
+    """Пишет в консоль сразу, CSV — отдельно (сбой CSV не глушит логи)."""
+    error = _redact_secrets(error)
     # #region agent log
     _agent_dbg(
         "A",
@@ -174,6 +188,20 @@ def log_event(
         {"event": event, "level": level, "chat_id": str(chat_id), "csv_path": str(LOG_CSV_PATH)},
     )
     # #endregion
+
+    console_msg = (
+        f"event={event} user={username} chat={chat_id} "
+        f"msg={incoming_message!r} llm_sec={llm_duration_sec} http={http_status}"
+    )
+    if error:
+        console_msg += f" error={error}"
+    # Консоль ПЕРВОЙ — иначе падение CSV оставляло Amvera без логов
+    if level == "ERROR":
+        logger.error(console_msg)
+    else:
+        logger.info(console_msg)
+    print(console_msg, flush=True)
+
     row = [
         datetime.now(timezone.utc).isoformat(),
         level,
@@ -186,6 +214,7 @@ def log_event(
         error,
     ]
     try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
         with open(LOG_CSV_PATH, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(row)
         # #region agent log
@@ -200,18 +229,7 @@ def log_event(
             {"event": event, "error": str(e)},
         )
         # #endregion
-        raise
-
-    console_msg = (
-        f"event={event} user={username} chat={chat_id} "
-        f"msg={incoming_message!r} llm_sec={llm_duration_sec} http={http_status}"
-    )
-    if error:
-        console_msg += f" error={error}"
-    if level == "ERROR":
-        logger.error(console_msg)
-    else:
-        logger.info(console_msg)
+        logger.error("CSV log write failed event=%s: %s", event, e)
 
 
 def get_username(message) -> str:
@@ -367,12 +385,12 @@ def ask_deepseek(
         content = limit_sentences(data["choices"][0]["message"]["content"].strip())
         duration = round(time.perf_counter() - started, 3)
         return content, duration, http_status, ""
-    except requests.RequestException as e:
+    except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as e:
         duration = round(time.perf_counter() - started, 3)
-        error_text = str(e)
+        error_text = _redact_secrets(str(e))
         if getattr(e, "response", None) is not None:
             http_status = str(e.response.status_code)
-            error_text = f"{e} | body={e.response.text[:500]}"
+            error_text = _redact_secrets(f"{e} | body={e.response.text[:500]}")
         return None, duration, http_status, error_text
 
 
