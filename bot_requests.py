@@ -5,6 +5,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -19,17 +20,13 @@ AMVERA_API_BASE = os.getenv("AMVERA_API_BASE", "https://inference.waw0.amvera.ru
 AMVERA_MODEL = os.getenv("AMVERA_MODEL", "deepseek-v3")
 LLM_TIMEOUT = 180
 LLM_RETRIES = 3
-LLM_RETRY_DELAY = 3  # секунды между попытками к Amvera
+LLM_RETRY_DELAY = 3
 MAX_SENTENCES = 7
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_CSV_FILE = os.getenv("LOG_CSV_FILE", "bot.csv")
 
 
 def resolve_log_dir() -> Path:
-    """
-    Amvera: постоянный диск обычно смонтирован в /data → logs/bot.csv виден в Data.
-    Локально: папка logs/ в каталоге проекта.
-    """
     explicit = os.getenv("LOG_DIR")
     if explicit:
         path = Path(explicit)
@@ -50,7 +47,9 @@ if not AMVERA_API_TOKEN:
     raise ValueError("Задайте AMVERA_API_TOKEN в .env")
 
 TG_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
+TG_HOST = "api.telegram.org"
 LLM_URL = f"{AMVERA_API_BASE}/v1/chat/completions"
+LLM_HOST = urlparse(AMVERA_API_BASE).netloc or "inference.waw0.amvera.ru"
 
 SYSTEM_PROMPT = (
     "Ты таролог и психолог. Отвечай на вопросы пользователя как таролог или психолог в зависимости от полноты контекста. "
@@ -86,67 +85,34 @@ HELP_TEXT = (
 
 CSV_HEADERS = [
     "datetime",
-    "level",
-    "username",
+    "method",
+    "to_host",
+    "from_user",
     "chat_id",
-    "incoming_message",
-    "llm_duration_sec",
-    "http_status",
-    "event",
+    "content",
+    "attempt",
+    "status",
+    "sec",
     "error",
 ]
 
 logger = logging.getLogger("tarot_bot")
 
 TELEGRAM_MAX_LENGTH = 4096
-SEND_MESSAGE_RETRIES = 10  # финальный ответ / ошибка
-SHUFFLING_RETRIES = 2  # быстрый «карты тасуются…»
-SEND_MESSAGE_RETRY_DELAY = 5  # секунды между попытками
-
-# #region agent log
-DEBUG_LOG_PATH = Path(__file__).resolve().parent / "debug-843ab9.log"
-
-
-def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
-    import json
-    import sys
-
-    payload = {
-        "sessionId": "843ab9",
-        "runId": "post-fix",
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data or {},
-        "timestamp": int(time.time() * 1000),
-    }
-    line = json.dumps(payload, ensure_ascii=False)
-    for path in {DEBUG_LOG_PATH, LOG_DIR / "debug-843ab9.log"}:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except OSError:
-            pass
-    # print+flush: Amvera иногда не показывает INFO из logging
-    print(f"DBG [{hypothesis_id}] {message} {data or {}}", flush=True, file=sys.stderr)
-    try:
-        logger.error("DBG [%s] %s %s", hypothesis_id, message, data or {})
-    except Exception:
-        pass
-# #endregion
+SEND_MESSAGE_RETRIES = 10
+SHUFFLING_RETRIES = 2
+SEND_MESSAGE_RETRY_DELAY = 5
 
 
 def setup_logging():
-    """Консоль (текст) + CSV-файл без ротации."""
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        if not LOG_CSV_PATH.exists():
+        write_header = not LOG_CSV_PATH.exists()
+        if write_header:
             with open(LOG_CSV_PATH, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(CSV_HEADERS)
     except OSError as e:
-        # Не роняем бота из‑за CSV: консольные логи важнее
-        print(f"Не удалось подготовить CSV-логи {LOG_CSV_PATH}: {e}", flush=True)
+        logger.error("Не удалось подготовить CSV-логи %s: %s", LOG_CSV_PATH, e)
 
     level = getattr(logging, LOG_LEVEL, logging.INFO)
     logger.setLevel(level)
@@ -157,7 +123,6 @@ def setup_logging():
             logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
         )
         logger.addHandler(console)
-    logger.info("CSV-логи: %s", LOG_CSV_PATH)
 
 
 def _redact_secrets(text: str) -> str:
@@ -171,69 +136,60 @@ def _redact_secrets(text: str) -> str:
     return out
 
 
-def log_event(
-    level: str,
-    username: str,
-    chat_id,
-    incoming_message: str,
+def _preview(text: str, limit: int = 120) -> str:
+    text = (text or "").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def log_request(
+    method: str,
+    to_host: str,
     *,
-    llm_duration_sec: str = "",
-    http_status: str = "",
-    event: str = "",
+    from_user: str = "",
+    chat_id="",
+    content: str = "",
+    attempt: str = "1/1",
+    status: str = "ok",
+    sec: float | str = "",
     error: str = "",
 ):
-    """Пишет в консоль сразу, CSV — отдельно (сбой CSV не глушит логи)."""
+    """Одна строка лога на сетевой запрос (консоль + CSV)."""
     error = _redact_secrets(error)
-    # #region agent log
-    _agent_dbg(
-        "A",
-        "bot_requests.py:log_event:entry",
-        "log_event called",
-        {"event": event, "level": level, "chat_id": str(chat_id), "csv_path": str(LOG_CSV_PATH)},
-    )
-    # #endregion
-
-    console_msg = (
-        f"event={event} user={username} chat={chat_id} "
-        f"msg={incoming_message!r} llm_sec={llm_duration_sec} http={http_status}"
+    content = _preview(content)
+    sec_str = f"{sec}" if sec != "" else ""
+    line = (
+        f"{method} → {to_host} "
+        f"from={from_user or '-'} chat={chat_id or '-'} "
+        f"content={content!r} attempt={attempt} status={status} sec={sec_str}"
     )
     if error:
-        console_msg += f" error={error}"
-    # Консоль ПЕРВОЙ — иначе падение CSV оставляло Amvera без логов
-    if level == "ERROR":
-        logger.error(console_msg)
+        line += f" error={error}"
+
+    if status == "ok":
+        logger.info(line)
     else:
-        logger.info(console_msg)
-    print(console_msg, flush=True)
+        logger.error(line)
 
     row = [
         datetime.now(timezone.utc).isoformat(),
-        level,
-        username,
+        method,
+        to_host,
+        from_user,
         chat_id,
-        incoming_message,
-        llm_duration_sec,
-        http_status,
-        event,
+        content,
+        attempt,
+        status,
+        sec_str,
         error,
     ]
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         with open(LOG_CSV_PATH, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(row)
-        # #region agent log
-        _agent_dbg("A", "bot_requests.py:log_event:csv_ok", "csv write ok", {"event": event})
-        # #endregion
     except Exception as e:
-        # #region agent log
-        _agent_dbg(
-            "A",
-            "bot_requests.py:log_event:csv_fail",
-            "csv write failed",
-            {"event": event, "error": str(e)},
-        )
-        # #endregion
-        logger.error("CSV log write failed event=%s: %s", event, e)
+        logger.error("CSV write failed: %s", e)
 
 
 def get_username(message) -> str:
@@ -248,33 +204,44 @@ def get_username(message) -> str:
 
 
 def get_updates(offset=None):
-    """Запрашивает у Telegram новые сообщения."""
+    """Запрашивает у Telegram новые сообщения. Успехи не логируем."""
     params = {"timeout": 100, "offset": offset}
+    started = time.perf_counter()
     try:
         response = requests.get(TG_URL + "getUpdates", params=params, timeout=102)
         response.raise_for_status()
         return response.json().get("result", [])
     except Exception as e:
-        log_event(
-            "ERROR",
-            "",
-            "",
-            "",
-            event="telegram_get_updates",
+        log_request(
+            "getUpdates",
+            TG_HOST,
+            content="poll",
+            status="fail",
+            sec=round(time.perf_counter() - started, 3),
             error=str(e),
         )
         return []
 
 
-def send_message(chat_id, text, retries: int = SEND_MESSAGE_RETRIES) -> bool:
-    """Отправляет сообщение пользователю. retries попыток с паузой 5 сек. Возвращает True при успехе."""
+def send_message(
+    chat_id,
+    text,
+    *,
+    retries: int = SEND_MESSAGE_RETRIES,
+    kind: str = "message",
+    from_user: str = "",
+) -> bool:
+    """Отправляет сообщение. В лог — итог (с номером успешной/последней попытки)."""
     if len(text) > TELEGRAM_MAX_LENGTH:
         text = text[: TELEGRAM_MAX_LENGTH - 3] + "..."
 
     last_error = ""
-    last_http_status = ""
+    started = time.perf_counter()
+    used_attempt = 1
 
     for attempt in range(1, retries + 1):
+        used_attempt = attempt
+        attempt_started = time.perf_counter()
         try:
             response = requests.post(
                 TG_URL + "sendMessage",
@@ -283,65 +250,48 @@ def send_message(chat_id, text, retries: int = SEND_MESSAGE_RETRIES) -> bool:
             )
             data = response.json()
             if data.get("ok"):
-                if attempt > 1:
-                    logger.info(
-                        "sendMessage успех с попытки %s/%s chat=%s",
-                        attempt,
-                        retries,
-                        chat_id,
-                    )
+                log_request(
+                    "sendMessage",
+                    TG_HOST,
+                    from_user=from_user,
+                    chat_id=chat_id,
+                    content=kind,
+                    attempt=f"{attempt}/{retries}",
+                    status="ok",
+                    sec=round(time.perf_counter() - attempt_started, 3),
+                )
                 return True
-
-            last_http_status = str(response.status_code)
             last_error = data.get("description", "Telegram API error")
         except Exception as e:
-            last_http_status = ""
-            if isinstance(e, requests.HTTPError) and e.response is not None:
-                last_http_status = str(e.response.status_code)
             last_error = str(e)
 
-        logger.warning(
-            "sendMessage попытка %s/%s не удалась chat=%s: %s",
-            attempt,
-            retries,
-            chat_id,
-            last_error,
-        )
         if attempt < retries:
             time.sleep(SEND_MESSAGE_RETRY_DELAY)
 
-    log_event(
-        "ERROR",
-        "",
-        chat_id,
-        "",
-        http_status=last_http_status,
-        event="telegram_send_message",
-        error=f"после {retries} попыток: {_redact_secrets(last_error)}",
+    log_request(
+        "sendMessage",
+        TG_HOST,
+        from_user=from_user,
+        chat_id=chat_id,
+        content=kind,
+        attempt=f"{used_attempt}/{retries}",
+        status="fail",
+        sec=round(time.perf_counter() - started, 3),
+        error=last_error,
     )
     return False
 
 
 def save_history(chat_id: int, user_text: str, answer: str | None = None) -> None:
-    """Сохраняет историю; ошибки БД не блокируют ответ в Telegram."""
     try:
         add_message(chat_id, "user", user_text)
         if answer:
             add_message(chat_id, "assistant", answer)
     except Exception as e:
-        logger.error("Не удалось сохранить историю chat=%s: %s", chat_id, e)
-        log_event(
-            "ERROR",
-            "",
-            chat_id,
-            user_text,
-            event="history_save_fail",
-            error=str(e),
-        )
+        logger.error("history_save fail chat=%s error=%s", chat_id, e)
 
 
 def limit_sentences(text: str, max_sentences: int = MAX_SENTENCES) -> str:
-    """Обрезает ответ до заданного числа предложений."""
     text = text.strip()
     if not text:
         return text
@@ -354,10 +304,12 @@ def limit_sentences(text: str, max_sentences: int = MAX_SENTENCES) -> str:
 def ask_deepseek(
     user_text: str,
     history: list[dict[str, str]],
+    *,
+    from_user: str = "",
+    chat_id="",
 ) -> tuple[str | None, float, str, str]:
     """
-    Запрос к DeepSeek v3 через Amvera с учётом истории диалога.
-    До LLM_RETRIES попыток при таймауте/сетевой ошибке.
+    Запрос к DeepSeek. Логирует один итог по всем попыткам.
     Возвращает: (ответ, длительность_сек, http_status, текст_ошибки).
     """
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -377,8 +329,10 @@ def ask_deepseek(
     started = time.perf_counter()
     http_status = ""
     error_text = ""
+    used_attempt = 1
 
     for attempt in range(1, LLM_RETRIES + 1):
+        used_attempt = attempt
         try:
             response = requests.post(
                 LLM_URL,
@@ -391,177 +345,105 @@ def ask_deepseek(
             data = response.json()
             content = limit_sentences(data["choices"][0]["message"]["content"].strip())
             duration = round(time.perf_counter() - started, 3)
-            # #region agent log
-            _agent_dbg(
-                "B",
-                "bot_requests.py:ask_deepseek:ok",
-                "llm ok",
-                {"attempt": attempt, "duration": duration, "http_status": http_status},
+            log_request(
+                "chat/completions",
+                LLM_HOST,
+                from_user=from_user,
+                chat_id=chat_id,
+                content=user_text,
+                attempt=f"{attempt}/{LLM_RETRIES}",
+                status="ok",
+                sec=duration,
             )
-            # #endregion
             return content, duration, http_status, ""
         except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as e:
-            duration = round(time.perf_counter() - started, 3)
             error_text = _redact_secrets(str(e))
             if getattr(e, "response", None) is not None:
                 http_status = str(e.response.status_code)
-                error_text = _redact_secrets(f"{e} | body={e.response.text[:500]}")
-            # #region agent log
-            _agent_dbg(
-                "B",
-                "bot_requests.py:ask_deepseek:fail",
-                "llm attempt failed",
-                {
-                    "attempt": attempt,
-                    "duration": duration,
-                    "http_status": http_status,
-                    "error_preview": error_text[:200],
-                },
-            )
-            # #endregion
-            # 4xx (кроме 408/429) обычно не лечатся ретраем
+                error_text = _redact_secrets(f"{e} | body={e.response.text[:300]}")
             if http_status and http_status.startswith("4") and http_status not in ("408", "429"):
                 break
             if attempt < LLM_RETRIES:
                 time.sleep(LLM_RETRY_DELAY)
 
-    return None, round(time.perf_counter() - started, 3), http_status, error_text
+    duration = round(time.perf_counter() - started, 3)
+    log_request(
+        "chat/completions",
+        LLM_HOST,
+        from_user=from_user,
+        chat_id=chat_id,
+        content=user_text,
+        attempt=f"{used_attempt}/{LLM_RETRIES}",
+        status="fail",
+        sec=duration,
+        error=error_text,
+    )
+    return None, duration, http_status, error_text
 
 
 def handle_message(message):
-    """Обрабатывает входящие сообщения."""
     chat_id = message["chat"]["id"]
     username = get_username(message)
     text = message.get("text")
 
     if not text:
-        send_message(chat_id, NO_TEXT_HINT)
-        log_event(
-            "INFO",
-            username,
-            chat_id,
-            "",
-            event="no_text",
-        )
+        send_message(chat_id, NO_TEXT_HINT, kind="hint_no_text", from_user=username)
         return
 
     if text in ("/start", "/help"):
-        send_message(chat_id, START_TEXT if text == "/start" else HELP_TEXT)
-        log_event(
-            "INFO",
-            username,
+        send_message(
             chat_id,
-            text,
-            event="command",
+            START_TEXT if text == "/start" else HELP_TEXT,
+            kind=f"command:{text}",
+            from_user=username,
         )
         return
 
     if text == "/clear":
         clear_history(chat_id)
-        send_message(chat_id, CLEAR_TEXT)
-        log_event(
-            "INFO",
-            username,
-            chat_id,
-            text,
-            event="history_clear",
-        )
+        send_message(chat_id, CLEAR_TEXT, kind="command:/clear", from_user=username)
         return
 
-    # Сразу даём понять, что запрос принят — до БД и LLM (мало ретраев, чтобы быстрее идти к LLM)
-    send_message(chat_id, SHUFFLING_TEXT, retries=SHUFFLING_RETRIES)
+    send_message(
+        chat_id,
+        SHUFFLING_TEXT,
+        retries=SHUFFLING_RETRIES,
+        kind="shuffle",
+        from_user=username,
+    )
 
     if expire_if_inactive(chat_id):
-        send_message(chat_id, EXPIRY_NOTICE)
+        send_message(chat_id, EXPIRY_NOTICE, kind="expiry_notice", from_user=username)
 
     history = get_history(chat_id)
-    # #region agent log
-    _agent_dbg(
-        "B",
-        "bot_requests.py:handle_message:before_llm",
-        "about to call llm",
-        {"chat_id": chat_id, "history_len": len(history), "text_len": len(text)},
+    answer, llm_sec, http_status, error_text = ask_deepseek(
+        text,
+        history,
+        from_user=username,
+        chat_id=chat_id,
     )
-    # #endregion
-    answer, llm_sec, http_status, error_text = ask_deepseek(text, history)
-    # #region agent log
-    _agent_dbg(
-        "B",
-        "bot_requests.py:handle_message:after_llm",
-        "llm finished",
-        {
-            "chat_id": chat_id,
-            "has_answer": bool(answer),
-            "llm_sec": llm_sec,
-            "http_status": http_status,
-            "error_preview": (error_text or "")[:200],
-        },
-    )
-    # #endregion
 
     if answer:
-        sent = send_message(chat_id, answer + SHARE_FOOTER)
-        # #region agent log
-        _agent_dbg(
-            "C",
-            "bot_requests.py:handle_message:answer_send",
-            "oracle answer send result",
-            {"chat_id": chat_id, "sent": sent, "answer_len": len(answer)},
+        sent = send_message(
+            chat_id,
+            answer + SHARE_FOOTER,
+            kind="answer",
+            from_user=username,
         )
-        # #endregion
         if sent:
             save_history(chat_id, text, answer)
-            log_event(
-                "INFO",
-                username,
-                chat_id,
-                text,
-                llm_duration_sec=str(llm_sec),
-                http_status=http_status,
-                event="llm_ok",
-            )
         else:
             save_history(chat_id, text)
-            send_message(chat_id, ERROR_TAROT)
-            log_event(
-                "ERROR",
-                username,
-                chat_id,
-                text,
-                llm_duration_sec=str(llm_sec),
-                http_status=http_status,
-                event="telegram_answer_fail",
-                error="Не удалось отправить ответ в Telegram",
-            )
+            send_message(chat_id, ERROR_TAROT, kind="error_tarot", from_user=username)
     else:
-        # #region agent log
-        _agent_dbg(
-            "B",
-            "bot_requests.py:handle_message:llm_fail_branch",
-            "entering llm_fail branch",
-            {"chat_id": chat_id, "http_status": http_status},
-        )
-        # #endregion
         save_history(chat_id, text)
-        send_message(chat_id, ERROR_TAROT)
-        log_event(
-            "ERROR",
-            username,
-            chat_id,
-            text,
-            llm_duration_sec=str(llm_sec),
-            http_status=http_status,
-            event="llm_fail",
-            error=error_text,
-        )
+        send_message(chat_id, ERROR_TAROT, kind="error_tarot", from_user=username)
 
 
 def main():
     setup_logging()
     init_db()
-    logger.info("Бот запущен")
-    logger.info("История диалогов: %s", DB_PATH)
-    log_event("INFO", "", "", "", event="bot_start")
+    logger.info("bot_start history=%s logs=%s", DB_PATH, LOG_CSV_PATH)
     last_update_id = 0
     while True:
         updates = get_updates(offset=last_update_id + 1)
@@ -571,14 +453,6 @@ def main():
                 try:
                     handle_message(update["message"])
                 except Exception as e:
-                    # #region agent log
-                    _agent_dbg(
-                        "D",
-                        "bot_requests.py:main:handle_exception",
-                        "unhandled exception in handle_message",
-                        {"error": str(e)},
-                    )
-                    # #endregion
                     logger.exception("Ошибка обработки сообщения: %s", e)
         time.sleep(1)
 
