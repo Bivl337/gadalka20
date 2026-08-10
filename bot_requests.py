@@ -17,7 +17,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AMVERA_API_TOKEN = os.getenv("AMVERA_API_TOKEN")
 AMVERA_API_BASE = os.getenv("AMVERA_API_BASE", "https://inference.waw0.amvera.ru").rstrip("/")
 AMVERA_MODEL = os.getenv("AMVERA_MODEL", "deepseek-v3")
-LLM_TIMEOUT = 45
+LLM_TIMEOUT = 100
 LLM_RETRIES = 3
 LLM_RETRY_DELAY = 3  # секунды между попытками к Amvera
 MAX_SENTENCES = 7
@@ -78,7 +78,7 @@ HELP_TEXT = (
     "📖 Как пользоваться ботом:\n\n"
     "• Напишите вопрос обычным текстом — я отвечу раскладом.\n"
     "• Можно спрашивать о делах, отношениях, планах и выборе.\n"
-    "• Я помню до 10 последних вопросов в этом чате.\n"
+    "• Я помню несколько последних реплик в этом чате.\n"
     "• Команды: /start — приветствие, /help — справка, /clear — забыть контекст.\n\n"
     "Ответы носят развлекательный характер и не заменяют совет специалиста."
 )
@@ -466,6 +466,9 @@ def handle_message(message):
         )
         return
 
+    # Сразу даём понять, что запрос принят — до БД и LLM
+    send_message(chat_id, SHUFFLING_TEXT)
+
     if expire_if_inactive(chat_id):
         send_message(chat_id, EXPIRY_NOTICE)
 
@@ -478,7 +481,6 @@ def handle_message(message):
         {"chat_id": chat_id, "history_len": len(history), "text_len": len(text)},
     )
     # #endregion
-    send_message(chat_id, SHUFFLING_TEXT)
     answer, llm_sec, http_status, error_text = ask_deepseek(text, history)
     # #region agent log
     _agent_dbg(

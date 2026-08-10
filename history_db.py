@@ -3,7 +3,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-MAX_HISTORY_PAIRS = 10
+MAX_HISTORY_MESSAGES = 5
 INACTIVITY_DAYS = 10
 
 
@@ -105,17 +105,21 @@ def get_history(chat_id: int) -> list[dict[str, str]]:
         rows = conn.execute(
             """
             SELECT role, content
-            FROM messages
-            WHERE chat_id = ?
+            FROM (
+                SELECT id, role, content
+                FROM messages
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+            )
             ORDER BY id ASC
             """,
-            (chat_id,),
+            (chat_id, MAX_HISTORY_MESSAGES),
         ).fetchall()
     return [{"role": row["role"], "content": row["content"]} for row in rows]
 
 
 def _trim_history(conn: sqlite3.Connection, chat_id: int) -> None:
-    max_messages = MAX_HISTORY_PAIRS * 2
     conn.execute(
         """
         DELETE FROM messages
@@ -127,7 +131,7 @@ def _trim_history(conn: sqlite3.Connection, chat_id: int) -> None:
               LIMIT ?
           )
         """,
-        (chat_id, chat_id, max_messages),
+        (chat_id, chat_id, MAX_HISTORY_MESSAGES),
     )
 
 
