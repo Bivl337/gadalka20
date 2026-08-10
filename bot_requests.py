@@ -17,7 +17,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AMVERA_API_TOKEN = os.getenv("AMVERA_API_TOKEN")
 AMVERA_API_BASE = os.getenv("AMVERA_API_BASE", "https://inference.waw0.amvera.ru").rstrip("/")
 AMVERA_MODEL = os.getenv("AMVERA_MODEL", "deepseek-v3")
-LLM_TIMEOUT = 100
+LLM_TIMEOUT = 180
 LLM_RETRIES = 3
 LLM_RETRY_DELAY = 3  # секунды между попытками к Amvera
 MAX_SENTENCES = 7
@@ -99,7 +99,8 @@ CSV_HEADERS = [
 logger = logging.getLogger("tarot_bot")
 
 TELEGRAM_MAX_LENGTH = 4096
-SEND_MESSAGE_RETRIES = 5
+SEND_MESSAGE_RETRIES = 10  # финальный ответ / ошибка
+SHUFFLING_RETRIES = 2  # быстрый «карты тасуются…»
 SEND_MESSAGE_RETRY_DELAY = 5  # секунды между попытками
 
 # #region agent log
@@ -265,15 +266,15 @@ def get_updates(offset=None):
         return []
 
 
-def send_message(chat_id, text) -> bool:
-    """Отправляет сообщение пользователю. До 5 попыток с паузой 5 сек. Возвращает True при успехе."""
+def send_message(chat_id, text, retries: int = SEND_MESSAGE_RETRIES) -> bool:
+    """Отправляет сообщение пользователю. retries попыток с паузой 5 сек. Возвращает True при успехе."""
     if len(text) > TELEGRAM_MAX_LENGTH:
         text = text[: TELEGRAM_MAX_LENGTH - 3] + "..."
 
     last_error = ""
     last_http_status = ""
 
-    for attempt in range(1, SEND_MESSAGE_RETRIES + 1):
+    for attempt in range(1, retries + 1):
         try:
             response = requests.post(
                 TG_URL + "sendMessage",
@@ -286,7 +287,7 @@ def send_message(chat_id, text) -> bool:
                     logger.info(
                         "sendMessage успех с попытки %s/%s chat=%s",
                         attempt,
-                        SEND_MESSAGE_RETRIES,
+                        retries,
                         chat_id,
                     )
                 return True
@@ -302,11 +303,11 @@ def send_message(chat_id, text) -> bool:
         logger.warning(
             "sendMessage попытка %s/%s не удалась chat=%s: %s",
             attempt,
-            SEND_MESSAGE_RETRIES,
+            retries,
             chat_id,
             last_error,
         )
-        if attempt < SEND_MESSAGE_RETRIES:
+        if attempt < retries:
             time.sleep(SEND_MESSAGE_RETRY_DELAY)
 
     log_event(
@@ -316,7 +317,7 @@ def send_message(chat_id, text) -> bool:
         "",
         http_status=last_http_status,
         event="telegram_send_message",
-        error=f"после {SEND_MESSAGE_RETRIES} попыток: {last_error}",
+        error=f"после {retries} попыток: {_redact_secrets(last_error)}",
     )
     return False
 
@@ -467,8 +468,8 @@ def handle_message(message):
         )
         return
 
-    # Сразу даём понять, что запрос принят — до БД и LLM
-    send_message(chat_id, SHUFFLING_TEXT)
+    # Сразу даём понять, что запрос принят — до БД и LLM (мало ретраев, чтобы быстрее идти к LLM)
+    send_message(chat_id, SHUFFLING_TEXT, retries=SHUFFLING_RETRIES)
 
     if expire_if_inactive(chat_id):
         send_message(chat_id, EXPIRY_NOTICE)
