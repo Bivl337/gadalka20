@@ -47,9 +47,28 @@ if not AMVERA_API_TOKEN:
     raise ValueError("Задайте AMVERA_API_TOKEN в .env")
 
 TG_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
-TG_HOST = "api.telegram.org"
+TG_GET_UPDATES_URL = TG_URL + "getUpdates"
+TG_SEND_MESSAGE_URL = TG_URL + "sendMessage"
 LLM_URL = f"{AMVERA_API_BASE}/v1/chat/completions"
-LLM_HOST = urlparse(AMVERA_API_BASE).netloc or "inference.waw0.amvera.ru"
+
+
+def _endpoint(url: str) -> tuple[str, str, str]:
+    """host, port, scheme"""
+    p = urlparse(url)
+    host = p.hostname or ""
+    if p.port:
+        port = str(p.port)
+    elif p.scheme == "https":
+        port = "443"
+    elif p.scheme == "http":
+        port = "80"
+    else:
+        port = ""
+    return host, port, p.scheme or ""
+
+
+TG_HOST, TG_PORT, TG_SCHEME = _endpoint("https://api.telegram.org/")
+LLM_HOST, LLM_PORT, LLM_SCHEME = _endpoint(LLM_URL)
 
 SYSTEM_PROMPT = (
     "Ты таролог и психолог. Отвечай на вопросы пользователя как таролог или психолог в зависимости от полноты контекста. "
@@ -86,12 +105,17 @@ HELP_TEXT = (
 CSV_HEADERS = [
     "datetime",
     "method",
-    "to_host",
+    "scheme",
+    "host",
+    "port",
+    "url",
     "from_user",
     "chat_id",
     "content",
     "attempt",
     "status",
+    "http",
+    "timeout_sec",
     "sec",
     "error",
 ]
@@ -145,24 +169,35 @@ def _preview(text: str, limit: int = 300) -> str:
 
 def log_request(
     method: str,
-    to_host: str,
     *,
+    host: str = "",
+    port: str = "",
+    scheme: str = "https",
+    url: str = "",
     from_user: str = "",
     chat_id="",
     content: str = "",
     attempt: str = "1/1",
     status: str = "ok",
+    http: str = "",
+    timeout_sec: str | int | float = "",
     sec: float | str = "",
     error: str = "",
 ):
-    """Одна строка лога на сетевой запрос (консоль + CSV)."""
+    """Одна строка лога на сетевой запрос (консоль + CSV), с техдеталями."""
     error = _redact_secrets(error)
     content = _preview(content)
+    url_safe = _redact_secrets(url)
     sec_str = f"{sec}" if sec != "" else ""
+    timeout_str = f"{timeout_sec}" if timeout_sec != "" else ""
+    http_str = str(http) if http != "" else "-"
+
     line = (
-        f"{method} → {to_host} "
+        f"{method} → {scheme}://{host}:{port} "
+        f"url={url_safe} "
         f"from={from_user or '-'} chat={chat_id or '-'} "
-        f"content={content!r} attempt={attempt} status={status} sec={sec_str}"
+        f"content={content!r} attempt={attempt} "
+        f"status={status} http={http_str} timeout={timeout_str} sec={sec_str}"
     )
     if error:
         line += f" error={error}"
@@ -175,12 +210,17 @@ def log_request(
     row = [
         datetime.now(timezone.utc).isoformat(),
         method,
-        to_host,
+        scheme,
+        host,
+        port,
+        url_safe,
         from_user,
         chat_id,
         content,
         attempt,
         status,
+        http_str,
+        timeout_str,
         sec_str,
         error,
     ]
@@ -208,32 +248,52 @@ def get_updates(offset=None):
     params = {"timeout": 100, "offset": offset}
     started = time.perf_counter()
     try:
-        response = requests.get(TG_URL + "getUpdates", params=params, timeout=102)
+        response = requests.get(TG_GET_UPDATES_URL, params=params, timeout=102)
         response.raise_for_status()
-        return response.json().get("result", []), round(time.perf_counter() - started, 3)
+        return (
+            response.json().get("result", []),
+            round(time.perf_counter() - started, 3),
+            str(response.status_code),
+        )
     except Exception as e:
+        http = ""
+        if isinstance(e, requests.HTTPError) and e.response is not None:
+            http = str(e.response.status_code)
         log_request(
             "getUpdates",
-            TG_HOST,
+            host=TG_HOST,
+            port=TG_PORT,
+            scheme=TG_SCHEME,
+            url=TG_GET_UPDATES_URL,
             content="poll",
             status="fail",
+            http=http,
+            timeout_sec=102,
             sec=round(time.perf_counter() - started, 3),
             error=str(e),
         )
-        return [], round(time.perf_counter() - started, 3)
+        return [], round(time.perf_counter() - started, 3), http
 
 
-def log_incoming_update(update: dict, poll_sec: float = 0) -> None:
+def log_incoming_update(update: dict, poll_sec: float = 0, http: str = "200") -> None:
     """Лог входящего update из getUpdates (только когда есть сообщение)."""
+    common = dict(
+        host=TG_HOST,
+        port=TG_PORT,
+        scheme=TG_SCHEME,
+        url=TG_GET_UPDATES_URL,
+        http=http or "200",
+        timeout_sec=100,
+        sec=poll_sec,
+        status="ok",
+    )
     msg = update.get("message")
     if not msg:
         other = next((k for k in update if k != "update_id"), "unknown")
         log_request(
             "getUpdates",
-            TG_HOST,
             content=f"update_id={update.get('update_id')} type={other}",
-            status="ok",
-            sec=poll_sec,
+            **common,
         )
         return
 
@@ -266,12 +326,10 @@ def log_incoming_update(update: dict, poll_sec: float = 0) -> None:
     )
     log_request(
         "getUpdates",
-        TG_HOST,
         from_user=username,
         chat_id=chat_id,
         content=content,
-        status="ok",
-        sec=poll_sec,
+        **common,
     )
 
 
@@ -288,6 +346,7 @@ def send_message(
         text = text[: TELEGRAM_MAX_LENGTH - 3] + "..."
 
     last_error = ""
+    last_http = ""
     started = time.perf_counter()
     used_attempt = 1
 
@@ -296,38 +355,51 @@ def send_message(
         attempt_started = time.perf_counter()
         try:
             response = requests.post(
-                TG_URL + "sendMessage",
+                TG_SEND_MESSAGE_URL,
                 json={"chat_id": chat_id, "text": text},
                 timeout=10,
             )
+            last_http = str(response.status_code)
             data = response.json()
             if data.get("ok"):
                 log_request(
                     "sendMessage",
-                    TG_HOST,
+                    host=TG_HOST,
+                    port=TG_PORT,
+                    scheme=TG_SCHEME,
+                    url=TG_SEND_MESSAGE_URL,
                     from_user=from_user,
                     chat_id=chat_id,
                     content=kind,
                     attempt=f"{attempt}/{retries}",
                     status="ok",
+                    http=last_http,
+                    timeout_sec=10,
                     sec=round(time.perf_counter() - attempt_started, 3),
                 )
                 return True
             last_error = data.get("description", "Telegram API error")
         except Exception as e:
             last_error = str(e)
+            if isinstance(e, requests.HTTPError) and e.response is not None:
+                last_http = str(e.response.status_code)
 
         if attempt < retries:
             time.sleep(SEND_MESSAGE_RETRY_DELAY)
 
     log_request(
         "sendMessage",
-        TG_HOST,
+        host=TG_HOST,
+        port=TG_PORT,
+        scheme=TG_SCHEME,
+        url=TG_SEND_MESSAGE_URL,
         from_user=from_user,
         chat_id=chat_id,
         content=kind,
         attempt=f"{used_attempt}/{retries}",
         status="fail",
+        http=last_http,
+        timeout_sec=10,
         sec=round(time.perf_counter() - started, 3),
         error=last_error,
     )
@@ -399,12 +471,17 @@ def ask_deepseek(
             duration = round(time.perf_counter() - started, 3)
             log_request(
                 "chat/completions",
-                LLM_HOST,
+                host=LLM_HOST,
+                port=LLM_PORT,
+                scheme=LLM_SCHEME,
+                url=LLM_URL,
                 from_user=from_user,
                 chat_id=chat_id,
                 content=user_text,
                 attempt=f"{attempt}/{LLM_RETRIES}",
                 status="ok",
+                http=http_status,
+                timeout_sec=LLM_TIMEOUT,
                 sec=duration,
             )
             return content, duration, http_status, ""
@@ -421,12 +498,17 @@ def ask_deepseek(
     duration = round(time.perf_counter() - started, 3)
     log_request(
         "chat/completions",
-        LLM_HOST,
+        host=LLM_HOST,
+        port=LLM_PORT,
+        scheme=LLM_SCHEME,
+        url=LLM_URL,
         from_user=from_user,
         chat_id=chat_id,
         content=user_text,
         attempt=f"{used_attempt}/{LLM_RETRIES}",
         status="fail",
+        http=http_status,
+        timeout_sec=LLM_TIMEOUT,
         sec=duration,
         error=error_text,
     )
@@ -498,10 +580,10 @@ def main():
     logger.info("bot_start history=%s logs=%s", DB_PATH, LOG_CSV_PATH)
     last_update_id = 0
     while True:
-        updates, poll_sec = get_updates(offset=last_update_id + 1)
+        updates, poll_sec, poll_http = get_updates(offset=last_update_id + 1)
         for update in updates:
             last_update_id = update["update_id"]
-            log_incoming_update(update, poll_sec=poll_sec)
+            log_incoming_update(update, poll_sec=poll_sec, http=poll_http)
             if "message" in update:
                 try:
                     handle_message(update["message"])
