@@ -1,4 +1,5 @@
 import csv
+import json
 import logging
 import os
 import re
@@ -24,6 +25,8 @@ LLM_RETRY_DELAY = 3
 MAX_SENTENCES = 7
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_CSV_FILE = os.getenv("LOG_CSV_FILE", "bot.csv")
+DEBUG_HTTP = os.getenv("DEBUG_HTTP", "0").strip().lower() in ("1", "true", "yes", "on")
+DEBUG_HTTP_BODY_LIMIT = int(os.getenv("DEBUG_HTTP_BODY_LIMIT", "8000"))
 
 
 def resolve_log_dir() -> Path:
@@ -167,6 +170,72 @@ def _preview(text: str, limit: int = 300) -> str:
     return text[: limit - 1] + "…"
 
 
+def _redact_headers(headers) -> dict:
+    sensitive = {"authorization", "x-auth-token", "x-api-key", "cookie", "set-cookie"}
+    out = {}
+    for key, value in dict(headers or {}).items():
+        if str(key).lower() in sensitive:
+            out[str(key)] = "<REDACTED>"
+        else:
+            out[str(key)] = _redact_secrets(str(value))
+    return out
+
+
+def _clip_body(body: str) -> str:
+    body = _redact_secrets(body or "")
+    if len(body) > DEBUG_HTTP_BODY_LIMIT:
+        cut = len(body) - DEBUG_HTTP_BODY_LIMIT
+        return body[:DEBUG_HTTP_BODY_LIMIT] + f"\n... <truncated {cut} chars>"
+    return body
+
+
+def log_http_dump(
+    *,
+    http_method: str,
+    url: str,
+    request_headers=None,
+    request_params=None,
+    request_body: str | None = None,
+    response: requests.Response | None = None,
+    error: str = "",
+    sec: float | str = "",
+):
+    """Полный дамп HTTP при DEBUG_HTTP=1 (учебный режим)."""
+    if not DEBUG_HTTP:
+        return
+    lines = [
+        "----- DEBUG_HTTP BEGIN -----",
+        f"HTTP {http_method} {_redact_secrets(url)}",
+        f"sec={sec}",
+    ]
+    if request_headers is not None:
+        lines.append(
+            "REQUEST HEADERS: "
+            + json.dumps(_redact_headers(request_headers), ensure_ascii=False)
+        )
+    if request_params is not None:
+        lines.append(
+            "REQUEST PARAMS: "
+            + _redact_secrets(json.dumps(request_params, ensure_ascii=False))
+        )
+    if request_body is not None:
+        lines.append("REQUEST BODY:\n" + _clip_body(request_body))
+    if response is not None:
+        lines.append(f"RESPONSE STATUS: {response.status_code}")
+        lines.append(
+            "RESPONSE HEADERS: "
+            + json.dumps(_redact_headers(response.headers), ensure_ascii=False)
+        )
+        try:
+            lines.append("RESPONSE BODY:\n" + _clip_body(response.text))
+        except Exception:
+            lines.append("RESPONSE BODY: <unavailable>")
+    if error:
+        lines.append("ERROR: " + _redact_secrets(error))
+    lines.append("----- DEBUG_HTTP END -----")
+    logger.info("\n".join(lines))
+
+
 def log_request(
     method: str,
     *,
@@ -249,16 +318,33 @@ def get_updates(offset=None):
     started = time.perf_counter()
     try:
         response = requests.get(TG_GET_UPDATES_URL, params=params, timeout=102)
+        sec = round(time.perf_counter() - started, 3)
         response.raise_for_status()
-        return (
-            response.json().get("result", []),
-            round(time.perf_counter() - started, 3),
-            str(response.status_code),
-        )
+        result = response.json().get("result", [])
+        # Полный дамп только если пришли апдейты (не каждый пустой long poll)
+        if result:
+            log_http_dump(
+                http_method="GET",
+                url=TG_GET_UPDATES_URL,
+                request_params=params,
+                response=response,
+                sec=sec,
+            )
+        return result, sec, str(response.status_code)
     except Exception as e:
+        sec = round(time.perf_counter() - started, 3)
         http = ""
-        if isinstance(e, requests.HTTPError) and e.response is not None:
-            http = str(e.response.status_code)
+        resp = getattr(e, "response", None)
+        if isinstance(e, requests.HTTPError) and resp is not None:
+            http = str(resp.status_code)
+        log_http_dump(
+            http_method="GET",
+            url=TG_GET_UPDATES_URL,
+            request_params=params,
+            response=resp if isinstance(resp, requests.Response) else None,
+            error=str(e),
+            sec=sec,
+        )
         log_request(
             "getUpdates",
             host=TG_HOST,
@@ -269,10 +355,10 @@ def get_updates(offset=None):
             status="fail",
             http=http,
             timeout_sec=102,
-            sec=round(time.perf_counter() - started, 3),
+            sec=sec,
             error=str(e),
         )
-        return [], round(time.perf_counter() - started, 3), http
+        return [], sec, http
 
 
 def log_incoming_update(update: dict, poll_sec: float = 0, http: str = "200") -> None:
@@ -361,7 +447,16 @@ def send_message(
             )
             last_http = str(response.status_code)
             data = response.json()
+            req_body = json.dumps({"chat_id": chat_id, "text": text}, ensure_ascii=False)
             if data.get("ok"):
+                log_http_dump(
+                    http_method="POST",
+                    url=TG_SEND_MESSAGE_URL,
+                    request_headers={"Content-Type": "application/json"},
+                    request_body=req_body,
+                    response=response,
+                    sec=round(time.perf_counter() - attempt_started, 3),
+                )
                 log_request(
                     "sendMessage",
                     host=TG_HOST,
@@ -379,10 +474,36 @@ def send_message(
                 )
                 return True
             last_error = data.get("description", "Telegram API error")
+            log_http_dump(
+                http_method="POST",
+                url=TG_SEND_MESSAGE_URL,
+                request_headers={"Content-Type": "application/json"},
+                request_body=req_body,
+                response=response,
+                error=last_error,
+                sec=round(time.perf_counter() - attempt_started, 3),
+            )
         except Exception as e:
             last_error = str(e)
+            req_body = json.dumps({"chat_id": chat_id, "text": text}, ensure_ascii=False)
             if isinstance(e, requests.HTTPError) and e.response is not None:
                 last_http = str(e.response.status_code)
+                log_http_dump(
+                    http_method="POST",
+                    url=TG_SEND_MESSAGE_URL,
+                    request_body=req_body,
+                    response=e.response,
+                    error=last_error,
+                    sec=round(time.perf_counter() - attempt_started, 3),
+                )
+            else:
+                log_http_dump(
+                    http_method="POST",
+                    url=TG_SEND_MESSAGE_URL,
+                    request_body=req_body,
+                    error=last_error,
+                    sec=round(time.perf_counter() - attempt_started, 3),
+                )
 
         if attempt < retries:
             time.sleep(SEND_MESSAGE_RETRY_DELAY)
@@ -465,10 +586,18 @@ def ask_deepseek(
                 timeout=LLM_TIMEOUT,
             )
             http_status = str(response.status_code)
+            duration = round(time.perf_counter() - started, 3)
             response.raise_for_status()
             data = response.json()
             content = limit_sentences(data["choices"][0]["message"]["content"].strip())
-            duration = round(time.perf_counter() - started, 3)
+            log_http_dump(
+                http_method="POST",
+                url=LLM_URL,
+                request_headers=headers,
+                request_body=json.dumps(payload, ensure_ascii=False),
+                response=response,
+                sec=duration,
+            )
             log_request(
                 "chat/completions",
                 host=LLM_HOST,
@@ -486,10 +615,21 @@ def ask_deepseek(
             )
             return content, duration, http_status, ""
         except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as e:
+            duration = round(time.perf_counter() - started, 3)
             error_text = _redact_secrets(str(e))
-            if getattr(e, "response", None) is not None:
-                http_status = str(e.response.status_code)
-                error_text = _redact_secrets(f"{e} | body={e.response.text[:300]}")
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                http_status = str(resp.status_code)
+                error_text = _redact_secrets(f"{e} | body={resp.text[:300]}")
+            log_http_dump(
+                http_method="POST",
+                url=LLM_URL,
+                request_headers=headers,
+                request_body=json.dumps(payload, ensure_ascii=False),
+                response=resp if isinstance(resp, requests.Response) else None,
+                error=error_text,
+                sec=duration,
+            )
             if http_status and http_status.startswith("4") and http_status not in ("408", "429"):
                 break
             if attempt < LLM_RETRIES:
@@ -577,7 +717,12 @@ def handle_message(message):
 def main():
     setup_logging()
     init_db()
-    logger.info("bot_start history=%s logs=%s", DB_PATH, LOG_CSV_PATH)
+    logger.info(
+        "bot_start history=%s logs=%s DEBUG_HTTP=%s",
+        DB_PATH,
+        LOG_CSV_PATH,
+        DEBUG_HTTP,
+    )
     last_update_id = 0
     while True:
         updates, poll_sec, poll_http = get_updates(offset=last_update_id + 1)
