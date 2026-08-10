@@ -62,6 +62,7 @@ SYSTEM_PROMPT = (
 
 SHUFFLING_TEXT = "🃏 Карты тасуются…"
 ERROR_TAROT = "🔮 Сейчас тарологу плохо — карты молчат. Попробуйте чуть позже."
+SHARE_FOOTER = "\n\n🔮 @Gadalka20_bot <- сделай себе расклад"
 NO_TEXT_HINT = "✨ Напишите вопрос обычным текстом — и я сделаю расклад."
 EXPIRY_NOTICE = (
     "🌙 Прошло 10 дней тишины — оракул забыл прежний контекст. "
@@ -498,7 +499,7 @@ def handle_message(message):
     # #endregion
 
     if answer:
-        sent = send_message(chat_id, answer)
+        sent = send_message(chat_id, answer + SHARE_FOOTER)
         # #region agent log
         _agent_dbg(
             "C",
