@@ -136,7 +136,7 @@ def _redact_secrets(text: str) -> str:
     return out
 
 
-def _preview(text: str, limit: int = 120) -> str:
+def _preview(text: str, limit: int = 300) -> str:
     text = (text or "").replace("\n", " ").strip()
     if len(text) <= limit:
         return text
@@ -204,13 +204,13 @@ def get_username(message) -> str:
 
 
 def get_updates(offset=None):
-    """Запрашивает у Telegram новые сообщения. Успехи не логируем."""
+    """Запрашивает у Telegram новые сообщения. Пустые успешные poll не логируем."""
     params = {"timeout": 100, "offset": offset}
     started = time.perf_counter()
     try:
         response = requests.get(TG_URL + "getUpdates", params=params, timeout=102)
         response.raise_for_status()
-        return response.json().get("result", [])
+        return response.json().get("result", []), round(time.perf_counter() - started, 3)
     except Exception as e:
         log_request(
             "getUpdates",
@@ -220,7 +220,59 @@ def get_updates(offset=None):
             sec=round(time.perf_counter() - started, 3),
             error=str(e),
         )
-        return []
+        return [], round(time.perf_counter() - started, 3)
+
+
+def log_incoming_update(update: dict, poll_sec: float = 0) -> None:
+    """Лог входящего update из getUpdates (только когда есть сообщение)."""
+    msg = update.get("message")
+    if not msg:
+        other = next((k for k in update if k != "update_id"), "unknown")
+        log_request(
+            "getUpdates",
+            TG_HOST,
+            content=f"update_id={update.get('update_id')} type={other}",
+            status="ok",
+            sec=poll_sec,
+        )
+        return
+
+    chat_id = msg.get("chat", {}).get("id", "")
+    username = get_username(msg)
+    text = msg.get("text")
+    if text is None:
+        if msg.get("caption") is not None:
+            text = f"<caption> {msg.get('caption')}"
+        elif "photo" in msg:
+            text = "<photo>"
+        elif "voice" in msg:
+            text = "<voice>"
+        elif "document" in msg:
+            text = "<document>"
+        else:
+            text = "<non-text>"
+
+    tg_date = msg.get("date", "")
+    if tg_date:
+        try:
+            tg_date = datetime.fromtimestamp(int(tg_date), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            tg_date = str(msg.get("date"))
+
+    content = (
+        f"update_id={update.get('update_id')} "
+        f"message_id={msg.get('message_id')} "
+        f"tg_date={tg_date} | {text}"
+    )
+    log_request(
+        "getUpdates",
+        TG_HOST,
+        from_user=username,
+        chat_id=chat_id,
+        content=content,
+        status="ok",
+        sec=poll_sec,
+    )
 
 
 def send_message(
@@ -446,9 +498,10 @@ def main():
     logger.info("bot_start history=%s logs=%s", DB_PATH, LOG_CSV_PATH)
     last_update_id = 0
     while True:
-        updates = get_updates(offset=last_update_id + 1)
+        updates, poll_sec = get_updates(offset=last_update_id + 1)
         for update in updates:
             last_update_id = update["update_id"]
+            log_incoming_update(update, poll_sec=poll_sec)
             if "message" in update:
                 try:
                     handle_message(update["message"])
