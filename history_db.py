@@ -47,8 +47,85 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_messages_chat_id_id
                 ON messages(chat_id, id);
+
+            CREATE TABLE IF NOT EXISTS usage (
+                user_id INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, day)
+            );
+
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id INTEGER PRIMARY KEY,
+                expires_at TEXT NOT NULL,
+                last_charge_id TEXT
+            );
             """
         )
+
+
+# ---------- Лимиты запросов и подписка ----------
+
+MSK = timezone(timedelta(hours=3))  # Москва — UTC+3 без перехода на летнее время
+
+
+def today_msk() -> str:
+    """Календарный день по Москве (сброс лимита в 00:00 МСК)."""
+    return datetime.now(MSK).date().isoformat()
+
+
+def get_usage_today(user_id: int) -> int:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT count FROM usage WHERE user_id = ? AND day = ?",
+            (user_id, today_msk()),
+        ).fetchone()
+    return row["count"] if row else 0
+
+
+def increment_usage(user_id: int) -> int:
+    """+1 успешный запрос за сегодня, возвращает новое значение."""
+    day = today_msk()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO usage (user_id, day, count) VALUES (?, ?, 1)
+            ON CONFLICT(user_id, day) DO UPDATE SET count = count + 1
+            """,
+            (user_id, day),
+        )
+        conn.execute("DELETE FROM usage WHERE day < ?", (day,))  # старые дни не нужны
+        row = conn.execute(
+            "SELECT count FROM usage WHERE user_id = ? AND day = ?", (user_id, day)
+        ).fetchone()
+    return row["count"]
+
+
+def set_subscription(user_id: int, expires_at: datetime, charge_id: str = "") -> None:
+    """Сохраняет/продлевает подписку до expires_at (UTC)."""
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO subscriptions (user_id, expires_at, last_charge_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                expires_at = excluded.expires_at,
+                last_charge_id = excluded.last_charge_id
+            """,
+            (user_id, expires_at.astimezone(timezone.utc).isoformat(), charge_id),
+        )
+
+
+def get_subscription_expiry(user_id: int) -> datetime | None:
+    """Дата окончания активной подписки (UTC) или None, если её нет/истекла."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT expires_at FROM subscriptions WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    expires = _parse_iso(row["expires_at"])
+    return expires if expires > datetime.now(timezone.utc) else None
 
 
 def _now_iso() -> str:

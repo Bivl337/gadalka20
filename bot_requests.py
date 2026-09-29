@@ -4,14 +4,26 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
 
-from history_db import DB_PATH, add_message, clear_history, expire_if_inactive, get_history, init_db
+from history_db import (
+    DB_PATH,
+    MSK,
+    add_message,
+    clear_history,
+    expire_if_inactive,
+    get_history,
+    get_subscription_expiry,
+    get_usage_today,
+    increment_usage,
+    init_db,
+    set_subscription,
+)
 
 load_dotenv()
 
@@ -23,6 +35,11 @@ LLM_TIMEOUT = 180
 LLM_RETRIES = 3
 LLM_RETRY_DELAY = 3
 MAX_SENTENCES = 7
+FREE_DAILY_LIMIT = 4
+PREMIUM_DAILY_LIMIT = 100
+# Цена подписки в Telegram Stars за 30 дней (~100 ₽). Подберите под актуальный курс Stars.
+SUBSCRIPTION_STARS = int(os.getenv("SUBSCRIPTION_STARS", "75"))
+SUBSCRIPTION_PERIOD_SEC = 2592000  # 30 дней — единственный период, который поддерживает Telegram
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_CSV_FILE = os.getenv("LOG_CSV_FILE", "bot.csv")
 DEBUG_HTTP = os.getenv("DEBUG_HTTP", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -52,6 +69,8 @@ if not AMVERA_API_TOKEN:
 TG_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
 TG_GET_UPDATES_URL = TG_URL + "getUpdates"
 TG_SEND_MESSAGE_URL = TG_URL + "sendMessage"
+TG_CREATE_INVOICE_LINK_URL = TG_URL + "createInvoiceLink"
+TG_ANSWER_PRE_CHECKOUT_URL = TG_URL + "answerPreCheckoutQuery"
 LLM_URL = f"{AMVERA_API_BASE}/v1/chat/completions"
 
 
@@ -75,7 +94,7 @@ LLM_HOST, LLM_PORT, LLM_SCHEME = _endpoint(LLM_URL)
 
 SYSTEM_PROMPT = (
     "Ты таролог и психолог. Отвечай на вопросы пользователя как таролог или психолог в зависимости от полноты контекста."
-    "Будь совсем немного загадочным, но полезным. Если отвечаешь как таролог, отвечай с эмодзи и кратким раскладом. Каждая карта расклада с новой строки и без звездочек и тире. Отвечай как человек, а не ии."
+    "Будь совсем немного загадочным, но полезным. Если отвечаешь как таролог, отвечай с эмодзи и кратким раскладом. Каждая карта расклада с новой строки и без звездочек, тире и дефисов. Отвечай как человек, а не ии."
     ""
     f"Отвечай не более чем {MAX_SENTENCES} предложениями."
     "Учитывай предыдущий диалог, если он есть."
@@ -101,8 +120,33 @@ HELP_TEXT = (
     "• Напишите вопрос обычным текстом — я отвечу раскладом.\n"
     "• Можно спрашивать о делах, отношениях, планах и выборе.\n"
     "• Я помню несколько последних реплик в этом чате.\n"
-    "• Команды: /start — приветствие, /help — справка, /clear — забыть контекст.\n\n"
+    f"• Бесплатно — {FREE_DAILY_LIMIT} вопроса в день (сброс в полночь по Москве). "
+    f"Подписка {PREMIUM_DAILY_LIMIT} запросов в день.\n"
+    "• Команды: /start — приветствие, /help — справка, /clear — забыть контекст, "
+    "/subscribe — оформить подписку, /status — остаток запросов.\n\n"
     "Ответы носят развлекательный характер и не заменяют совет специалиста."
+)
+
+LIMIT_FREE_TEXT = (
+    f"🌙 На сегодня бесплатные расклады закончились ({FREE_DAILY_LIMIT} в день). "
+    "Новые появятся завтра после полуночи по Москве.\n\n"
+    f"✨ Хотите больше? Подписка на месяц — {SUBSCRIPTION_STARS} ⭐ (около 100 ₽) "
+    f"и {PREMIUM_DAILY_LIMIT} раскладов в день. Продлевается автоматически, "
+    "отменить можно в любой момент в настройках Telegram."
+)
+LIMIT_PREMIUM_TEXT = (
+    f"🌙 Вы использовали все {PREMIUM_DAILY_LIMIT} раскладов на сегодня. "
+    "Карты отдохнут до полуночи по Москве."
+)
+SUBSCRIBE_BUTTON_TEXT = f"⭐ Подписка {SUBSCRIPTION_STARS} ⭐ / мес"
+SUBSCRIBE_INFO_TEXT = (
+    f"🔮 Подписка: {PREMIUM_DAILY_LIMIT} раскладов в день на 30 дней за {SUBSCRIPTION_STARS} ⭐. "
+    "Продлевается автоматически, отмена — в настройках Telegram."
+)
+INVOICE_ERROR_TEXT = "🔮 Не удалось создать счёт. Попробуйте чуть позже."
+ALREADY_SUBSCRIBED_TEXT = "✨ Подписка уже активна до {date} (МСК). Продлится автоматически."
+PAYMENT_OK_TEXT = (
+    f"✨ Подписка активна до {{date}} (МСК). Теперь {PREMIUM_DAILY_LIMIT} раскладов в день!"
 )
 
 CSV_HEADERS = [
@@ -426,10 +470,14 @@ def send_message(
     retries: int = SEND_MESSAGE_RETRIES,
     kind: str = "message",
     from_user: str = "",
+    reply_markup: dict | None = None,
 ) -> bool:
     """Отправляет сообщение. В лог — итог (с номером успешной/последней попытки)."""
     if len(text) > TELEGRAM_MAX_LENGTH:
         text = text[: TELEGRAM_MAX_LENGTH - 3] + "..."
+    body = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        body["reply_markup"] = reply_markup
 
     last_error = ""
     last_http = ""
@@ -442,12 +490,12 @@ def send_message(
         try:
             response = requests.post(
                 TG_SEND_MESSAGE_URL,
-                json={"chat_id": chat_id, "text": text},
+                json=body,
                 timeout=10,
             )
             last_http = str(response.status_code)
             data = response.json()
-            req_body = json.dumps({"chat_id": chat_id, "text": text}, ensure_ascii=False)
+            req_body = json.dumps(body, ensure_ascii=False)
             if data.get("ok"):
                 log_http_dump(
                     http_method="POST",
@@ -485,7 +533,7 @@ def send_message(
             )
         except Exception as e:
             last_error = str(e)
-            req_body = json.dumps({"chat_id": chat_id, "text": text}, ensure_ascii=False)
+            req_body = json.dumps(body, ensure_ascii=False)
             if isinstance(e, requests.HTTPError) and e.response is not None:
                 last_http = str(e.response.status_code)
                 log_http_dump(
@@ -655,10 +703,120 @@ def ask_deepseek(
     return None, duration, http_status, error_text
 
 
+def _tg_call(url: str, payload: dict, kind: str) -> dict | None:
+    """Простой вызов Bot API с логированием. Возвращает data['result'] или None."""
+    started = time.perf_counter()
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+        data = response.json()
+        ok = bool(data.get("ok"))
+        log_request(
+            kind,
+            host=TG_HOST,
+            port=TG_PORT,
+            scheme=TG_SCHEME,
+            url=url,
+            content=kind,
+            status="ok" if ok else "fail",
+            http=str(response.status_code),
+            timeout_sec=15,
+            sec=round(time.perf_counter() - started, 3),
+            error="" if ok else data.get("description", "Telegram API error"),
+        )
+        return data.get("result") if ok else None
+    except Exception as e:
+        log_request(
+            kind,
+            host=TG_HOST,
+            port=TG_PORT,
+            scheme=TG_SCHEME,
+            url=url,
+            content=kind,
+            status="fail",
+            timeout_sec=15,
+            sec=round(time.perf_counter() - started, 3),
+            error=str(e),
+        )
+        return None
+
+
+def create_subscription_link(user_id: int) -> str | None:
+    """Ссылка на оплату месячной подписки в Stars (автопродление делает Telegram)."""
+    return _tg_call(
+        TG_CREATE_INVOICE_LINK_URL,
+        {
+            "title": "Подписка Гадалка Таро",
+            "description": f"{PREMIUM_DAILY_LIMIT} раскладов в день на 30 дней, продлевается автоматически",
+            "payload": f"sub:{user_id}",
+            "currency": "XTR",
+            "prices": [{"label": "Подписка на месяц", "amount": SUBSCRIPTION_STARS}],
+            "subscription_period": SUBSCRIPTION_PERIOD_SEC,
+        },
+        "createInvoiceLink",
+    )
+
+
+def send_subscribe_offer(chat_id, user_id: int, text: str, *, username: str = "", kind: str = "subscribe_offer") -> None:
+    link = create_subscription_link(user_id)
+    if not link:
+        send_message(chat_id, text + "\n\n" + INVOICE_ERROR_TEXT, kind=kind, from_user=username)
+        return
+    send_message(
+        chat_id,
+        text,
+        kind=kind,
+        from_user=username,
+        reply_markup={"inline_keyboard": [[{"text": SUBSCRIBE_BUTTON_TEXT, "url": link}]]},
+    )
+
+
+def _fmt_msk(dt: datetime) -> str:
+    return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M")
+
+
+def handle_pre_checkout(query: dict) -> None:
+    """Telegram требует ответить в течение 10 секунд."""
+    payload = query.get("invoice_payload", "")
+    ok = payload == f"sub:{query.get('from', {}).get('id')}"
+    body = {"pre_checkout_query_id": query["id"], "ok": ok}
+    if not ok:
+        body["error_message"] = "Не удалось проверить платёж. Попробуйте оформить подписку заново."
+    _tg_call(TG_ANSWER_PRE_CHECKOUT_URL, body, "answerPreCheckoutQuery")
+
+
+def handle_successful_payment(message: dict, username: str) -> None:
+    pay = message["successful_payment"]
+    user_id = message["from"]["id"]
+    chat_id = message["chat"]["id"]
+    exp_ts = pay.get("subscription_expiration_date")
+    if exp_ts:
+        expires = datetime.fromtimestamp(int(exp_ts), tz=timezone.utc)
+    else:  # запасной вариант, если Telegram не прислал дату
+        expires = datetime.now(timezone.utc) + timedelta(seconds=SUBSCRIPTION_PERIOD_SEC)
+    set_subscription(user_id, expires, pay.get("telegram_payment_charge_id", ""))
+    if pay.get("is_recurring") and not pay.get("is_first_recurring"):
+        return  # тихое автопродление — сообщение пользователю не нужно
+    send_message(
+        chat_id,
+        PAYMENT_OK_TEXT.format(date=_fmt_msk(expires)),
+        kind="payment_ok",
+        from_user=username,
+    )
+
+
+def daily_limit_for(user_id: int) -> int:
+    return PREMIUM_DAILY_LIMIT if get_subscription_expiry(user_id) else FREE_DAILY_LIMIT
+
+
 def handle_message(message):
     chat_id = message["chat"]["id"]
     username = get_username(message)
+    user_id = (message.get("from") or {}).get("id", chat_id)
     text = message.get("text")
+
+    if message.get("successful_payment"):
+        handle_successful_payment(message, username)
+        return
 
     if not text:
         send_message(chat_id, NO_TEXT_HINT, kind="hint_no_text", from_user=username)
@@ -676,6 +834,37 @@ def handle_message(message):
     if text == "/clear":
         clear_history(chat_id)
         send_message(chat_id, CLEAR_TEXT, kind="command:/clear", from_user=username)
+        return
+
+    if text == "/status":
+        expiry = get_subscription_expiry(user_id)
+        limit = daily_limit_for(user_id)
+        left = max(0, limit - get_usage_today(user_id))
+        line = f"🔮 Осталось раскладов сегодня: {left} из {limit}."
+        if expiry:
+            line += f"\nПодписка активна до {_fmt_msk(expiry)} (МСК)."
+        send_message(chat_id, line, kind="command:/status", from_user=username)
+        return
+
+    if text == "/subscribe":
+        expiry = get_subscription_expiry(user_id)
+        if expiry:
+            send_message(
+                chat_id,
+                ALREADY_SUBSCRIBED_TEXT.format(date=_fmt_msk(expiry)),
+                kind="command:/subscribe",
+                from_user=username,
+            )
+        else:
+            send_subscribe_offer(chat_id, user_id, SUBSCRIBE_INFO_TEXT, username=username, kind="command:/subscribe")
+        return
+
+    limit = daily_limit_for(user_id)
+    if get_usage_today(user_id) >= limit:
+        if limit == FREE_DAILY_LIMIT:
+            send_subscribe_offer(chat_id, user_id, LIMIT_FREE_TEXT, username=username, kind="limit_free")
+        else:
+            send_message(chat_id, LIMIT_PREMIUM_TEXT, kind="limit_premium", from_user=username)
         return
 
     send_message(
@@ -698,6 +887,7 @@ def handle_message(message):
     )
 
     if answer:
+        increment_usage(user_id)  # считаем только успешные ответы ИИ
         sent = send_message(
             chat_id,
             answer + SHARE_FOOTER,
@@ -729,7 +919,12 @@ def main():
         for update in updates:
             last_update_id = update["update_id"]
             log_incoming_update(update, poll_sec=poll_sec, http=poll_http)
-            if "message" in update:
+            if "pre_checkout_query" in update:
+                try:
+                    handle_pre_checkout(update["pre_checkout_query"])
+                except Exception as e:
+                    logger.exception("Ошибка pre_checkout: %s", e)
+            elif "message" in update:
                 try:
                     handle_message(update["message"])
                 except Exception as e:
