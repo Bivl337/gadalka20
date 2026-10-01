@@ -39,6 +39,8 @@ FREE_DAILY_LIMIT = 4
 PREMIUM_DAILY_LIMIT = 100
 # Цена подписки в Telegram Stars за 30 дней (~100 ₽). Подберите под актуальный курс Stars.
 SUBSCRIPTION_STARS = int(os.getenv("SUBSCRIPTION_STARS", "75"))
+# 1 — автопродление (подписка Stars), 0 — обычная разовая оплата на 30 дней без автопродления
+SUBSCRIPTION_RECURRING = os.getenv("SUBSCRIPTION_RECURRING", "1").strip().lower() in ("1", "true", "yes", "on")
 SUBSCRIPTION_PERIOD_SEC = 2592000  # 30 дней — единственный период, который поддерживает Telegram
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_CSV_FILE = os.getenv("LOG_CSV_FILE", "bot.csv")
@@ -742,19 +744,17 @@ def _tg_call(url: str, payload: dict, kind: str) -> dict | None:
 
 def create_subscription_link(user_id: int) -> str | None:
     """Ссылка на оплату месячной подписки в Stars (автопродление делает Telegram)."""
-    return _tg_call(
-        TG_CREATE_INVOICE_LINK_URL,
-        {
+    invoice = {
             "title": "Подписка Гадалка Таро",
-            "description": f"{PREMIUM_DAILY_LIMIT} раскладов в день на 30 дней, продлевается автоматически",
+            "description": f"{PREMIUM_DAILY_LIMIT} раскладов в день на 30 дней" + (", продлевается автоматически" if SUBSCRIPTION_RECURRING else ""),
             "payload": f"sub:{user_id}",
             "provider_token": "",  # для Telegram Stars токен провайдера должен быть пустым
             "currency": "XTR",
             "prices": [{"label": "Подписка на месяц", "amount": SUBSCRIPTION_STARS}],
-            "subscription_period": SUBSCRIPTION_PERIOD_SEC,
-        },
-        "createInvoiceLink",
-    )
+    }
+    if SUBSCRIPTION_RECURRING:
+        invoice["subscription_period"] = SUBSCRIPTION_PERIOD_SEC
+    return _tg_call(TG_CREATE_INVOICE_LINK_URL, invoice, "createInvoiceLink")
 
 
 def send_subscribe_offer(chat_id, user_id: int, text: str, *, username: str = "", kind: str = "subscribe_offer") -> None:
@@ -793,7 +793,8 @@ def handle_successful_payment(message: dict, username: str) -> None:
     if exp_ts:
         expires = datetime.fromtimestamp(int(exp_ts), tz=timezone.utc)
     else:  # запасной вариант, если Telegram не прислал дату
-        expires = datetime.now(timezone.utc) + timedelta(seconds=SUBSCRIPTION_PERIOD_SEC)
+        base = get_subscription_expiry(user_id) or datetime.now(timezone.utc)
+        expires = base + timedelta(seconds=SUBSCRIPTION_PERIOD_SEC)
     set_subscription(user_id, expires, pay.get("telegram_payment_charge_id", ""))
     if pay.get("is_recurring") and not pay.get("is_first_recurring"):
         return  # тихое автопродление — сообщение пользователю не нужно
