@@ -748,6 +748,7 @@ def create_subscription_link(user_id: int) -> str | None:
             "title": "Подписка Гадалка Таро",
             "description": f"{PREMIUM_DAILY_LIMIT} раскладов в день на 30 дней, продлевается автоматически",
             "payload": f"sub:{user_id}",
+            "provider_token": "",  # для Telegram Stars токен провайдера должен быть пустым
             "currency": "XTR",
             "prices": [{"label": "Подписка на месяц", "amount": SUBSCRIPTION_STARS}],
             "subscription_period": SUBSCRIPTION_PERIOD_SEC,
